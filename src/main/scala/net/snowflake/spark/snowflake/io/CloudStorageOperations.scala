@@ -319,6 +319,7 @@ object CloudStorageOperations {
             param.proxyInfo,
             param.maxRetryCount,
             param.expectedPartitionCount,
+            param.maxFileCountPerStage,
             pref = path,
             connection = conn
           ),
@@ -347,6 +348,7 @@ object CloudStorageOperations {
             param.proxyInfo,
             param.maxRetryCount,
             param.expectedPartitionCount,
+            param.maxFileCountPerStage,
             pref = prefix,
             connection = conn
           ),
@@ -473,12 +475,19 @@ private[io] object StorageInfo {
   @inline val AZURE_SAS = "azureSAS"
 }
 
+private[snowflake] case class CloudStageMetadata(stageName: String,
+                              internalPrefix: Option[String],
+                              cloudStorage: CloudStorage,
+                              storageInfo: Map[String, String]) {
+}
+
 sealed trait CloudStorage {
   protected val RETRY_SLEEP_TIME_UNIT_IN_MS: Int = 1500
   protected val MAX_SLEEP_TIME_IN_MS: Int = 3 * 60 * 1000
   private var processedFileCount = 0
   protected val connection: Connection
   protected val maxRetryCount: Int
+  protected val maxFileCountPerStage: Int
   protected val proxyInfo: Option[ProxyInfo]
 
   // The first 10 sleep time in second will be like
@@ -491,6 +500,13 @@ sealed trait CloudStorage {
     // jitter factor is 0.5
     expectedTime = expectedTime / 2 + Random.nextInt(expectedTime / 2)
     expectedTime
+  }
+
+  protected def getPrefix(dir: Option[String]): String = {
+    dir match {
+      case Some(str: String) => str
+      case None => Random.alphanumeric take 10 mkString ""
+    }
   }
 
   protected def getFileName(fileIndex: Int,
@@ -521,7 +537,7 @@ sealed trait CloudStorage {
   protected def uploadPartition(rows: Iterator[String],
                                 format: SupportedFormat,
                                 compress: Boolean,
-                                directory: String,
+                                directory: Option[String],
                                 partitionID: Int,
                                 storageInfo: Option[Map[String, String]],
                                 fileTransferMetadata: Option[SnowflakeFileTransferMetadata]
@@ -576,7 +592,7 @@ sealed trait CloudStorage {
           if (storageInfo.isDefined) {
             // Update data with StorageInfo
             val uploadStream =
-              createUploadStream(fileName, Some(directory), compress, storageInfo.get)
+              createUploadStream(fileName, directory, compress, storageInfo.get)
             uploadStream.write(data)
             uploadStream.close()
           } else if (fileTransferMetadata.isDefined) {
@@ -636,13 +652,16 @@ sealed trait CloudStorage {
             val sleepTime = retrySleepTimeInMS(retryCount)
             val stringWriter = new StringWriter
             e.printStackTrace(new PrintWriter(stringWriter))
-            val errmsg = s"${e.getMessage}, stacktrace: ${stringWriter.toString}"
+            val errmsg =
+              s"""${e.getClass.toString}, ${e.getMessage},
+                 | stacktrace: ${stringWriter.toString}""".stripMargin
 
             CloudStorageOperations.log.info(
               s"""${SnowflakeResultSetRDD.WORKER_LOG_PREFIX}: hit upload error:
                  | retryCount=$retryCount fileName=$fileName
                  | backoffTime=${sleepTime.toDouble / 1000.0}s
-                 | maxRetryCount=$maxRetryCount error details: [ $errmsg ]
+                 | maxRetryCount=$maxRetryCount maxFileCountPerStage=$maxFileCountPerStage
+                 | error details: [ $errmsg ]
                  |""".stripMargin.filter(_ >= ' ')
             )
 
@@ -673,7 +692,25 @@ sealed trait CloudStorage {
            |""".stripMargin.filter(_ >= ' '))
     }
 
-    new SingleElementIterator(s"$directory/$fileName")
+    val fileNameWithPrefix = if (directory.isDefined) {
+      s"${directory.get}/$fileName"
+    } else {
+      s"$fileName"
+    }
+
+    new SingleElementIterator(fileNameWithPrefix)
+  }
+
+  private var shardingStorages: Option[Seq[CloudStageMetadata]] = None
+
+  def getStagePrefixMap(): Map[String, Option[String]] = {
+    var resultMap = new HashMap[String, Option[String]]
+    if (shardingStorages.isDefined) {
+      for (cloudStorageMetadata <- shardingStorages.get) {
+        resultMap += (cloudStorageMetadata.stageName -> cloudStorageMetadata.internalPrefix)
+      }
+    }
+    resultMap
   }
 
   protected def uploadRDD(data: RDD[String],
@@ -681,18 +718,57 @@ sealed trait CloudStorage {
                           dir: Option[String],
                           compress: Boolean = true,
                           storageInfo: Map[String, String]): List[String] = {
+    val partitionCount = data.getNumPartitions
+    val isAzureInternalStage = this.isInstanceOf[InternalAzureStorage]
+    // val MAX_STAGE_COUNT = 32
+    val stageCount: Int = if (isAzureInternalStage) {
+      1 + partitionCount / maxFileCountPerStage
+      // Math.min(MAX_STAGE_COUNT, 1 + partitionCount / maxFileCountPerStage)
+    } else {
+      1
+    }
 
-    val directory: String =
-      dir match {
-        case Some(str: String) => str
-        case None => Random.alphanumeric take 10 mkString ""
+    val directory = getPrefix(dir)
+
+    // Add this stage to the map for Azure Internal Stage
+    // fileStageMap += (firstDirectory, "")
+    val stageDetails = StringBuilder.newBuilder
+    if (isAzureInternalStage) {
+      val azureInternalStorage = this.asInstanceOf[InternalAzureStorage]
+      var stages = new ListBuffer[CloudStageMetadata]()
+
+      // Add current cloud stage to the list first
+      stages += CloudStageMetadata(azureInternalStorage.stageName,
+        Some(directory), azureInternalStorage, storageInfo
+      )
+
+      // Create more cloud stage if necessary
+      for (_ <- 1 until stageCount) {
+        // Originally,
+        val (newStorage, newStageName) = CloudStorageOperations.createStorageClient(
+          azureInternalStorage.param, azureInternalStorage.connection,
+          tempStage = true, None, "load")
+        val newPrefix = getPrefix(dir)
+        val (newStorageInfo, _) = newStorage.getStageInfo(isWrite = true)
+
+        // Add this entry to the list
+        stages += CloudStageMetadata(newStageName, Some(newPrefix), newStorage, newStorageInfo)
       }
+
+      // setup stages
+      shardingStorages = Some(stages.toSeq)
+
+      stages.map(x => stageDetails.append(s"@${x.stageName}/${x.internalPrefix.getOrElse("")}, "))
+    }
 
     val startTime = System.currentTimeMillis()
     CloudStorageOperations.log.info(
       s"""${SnowflakeResultSetRDD.MASTER_LOG_PREFIX}:
          | Begin to process and upload data for ${data.getNumPartitions}
          | partitions: directory=$directory ${format.toString} $compress
+         | maxFileCountPerStage=$maxFileCountPerStage stageCount=$stageCount
+         | ActualFileCountPerStage=${partitionCount / stageCount}.x
+         | stageDetails: $stageDetails
          |""".stripMargin.filter(_ >= ' '))
 
     // Some explain for newbies on spark connector:
@@ -706,12 +782,21 @@ sealed trait CloudStorage {
         ///////////////////////////////////////////////////////////////////////
 
         // Convert and upload the partition with the StorageInfo
-        uploadPartition(rows, format, compress, directory, index, Some(storageInfo), None)
+        if (isAzureInternalStage) {
+          val uploadStageMetadata = shardingStorages.get.get(index % stageCount)
+          uploadPartition(
+                      rows, format, compress, uploadStageMetadata.internalPrefix, index,
+                      Some(uploadStageMetadata.storageInfo), None)
+        } else {
+          uploadPartition(rows, format, compress, Some(directory), index, Some(storageInfo), None)
+        }
 
         ///////////////////////////////////////////////////////////////////////
         // End code snippet to be executed on worker
         ///////////////////////////////////////////////////////////////////////
     }
+
+    val result = files.collect().toList
 
     val endTime = System.currentTimeMillis()
     CloudStorageOperations.log.info(
@@ -720,14 +805,16 @@ sealed trait CloudStorage {
          | ${(endTime - startTime) / 1000.0}s.
          |""".stripMargin.filter(_ >= ' '))
 
-    files.collect().toList
+    result
   }
 
   // Implement retry logic when download fails and finish the file download.
   def createDownloadStreamWithRetry(fileName: String,
                                     compress: Boolean,
                                     storageInfo: Map[String, String],
-                                    maxRetryCount: Int): InputStream = {
+                                    maxRetryCount: Int,
+                                    maxFileCountPerStage: Int
+  ): InputStream = {
     // download the file with retry and backoff and then consume.
     // val maxRetryCount = 10
     var retryCount = 0
@@ -850,6 +937,7 @@ case class InternalAzureStorage(param: MergedParameters,
     extends CloudStorage {
 
   override val maxRetryCount = param.maxRetryCount
+  override val maxFileCountPerStage = param.maxFileCountPerStage
   override val proxyInfo: Option[ProxyInfo] = param.proxyInfo
 
   override protected def getStageInfo(
@@ -902,7 +990,8 @@ case class InternalAzureStorage(param: MergedParameters,
         _,
         compress,
         stageInfo,
-        param.maxRetryCount
+        param.maxRetryCount,
+        param.maxFileCountPerStage
       ),
       param.expectedPartitionCount
     )
@@ -951,7 +1040,8 @@ case class InternalAzureStorage(param: MergedParameters,
           s"""${SnowflakeResultSetRDD.WORKER_LOG_PREFIX}:
              | Retrieve outputStream for uploading to internal stage:
              | file: $file client request id: $requestID
-
+             | container=${blob.getContainer.getName}
+             | URI=${blob.getUri.getAuthority}
              |""".stripMargin.filter(_ >=
             ' '))
         new CipherOutputStream(azureOutput, cipher)
@@ -962,6 +1052,8 @@ case class InternalAzureStorage(param: MergedParameters,
             s"""${SnowflakeResultSetRDD.WORKER_LOG_PREFIX}: Hit error when
                | retrieving outputStream for uploading to internal stage:
                | file: $file client request id: $requestID
+               | container=${blob.getContainer.getName}
+               | URI=${blob.getUri.getAuthority}
                | error message: ${ex.getMessage}
                |""".stripMargin.filter(_ >=
               ' '))
@@ -1058,6 +1150,8 @@ case class InternalAzureStorage(param: MergedParameters,
            | Retrieve inputStream for downloading from internal stage:
            | file: $fileName client request id: $downloadRequestID
            | download attribute: $downloadAttributeRequestID
+           | container=${blob.getContainer.getName}
+           | URI=${blob.getUri.getAuthority}
            |""".stripMargin.
           filter(_ >= ' '))
     } catch {
@@ -1067,6 +1161,8 @@ case class InternalAzureStorage(param: MergedParameters,
           s"""${SnowflakeResultSetRDD.WORKER_LOG_PREFIX}: Hit error when
              | retrieve inputStream for downloading from internal stage:
              | file: $fileName client request id: $requestID
+             | container=${blob.getContainer.getName}
+             | URI=${blob.getUri.getAuthority}
              | error message: ${ex.getMessage}
              |""".stripMargin.filter(_ >=
             ' '))
@@ -1092,6 +1188,7 @@ case class ExternalAzureStorage(containerName: String,
                                 azureSAS: String,
                                 override val proxyInfo: Option[ProxyInfo],
                                 override val maxRetryCount: Int,
+                                override val maxFileCountPerStage: Int,
                                 fileCountPerPartition: Int,
                                 pref: String = "",
                                 @transient override val connection: Connection)
@@ -1132,6 +1229,8 @@ case class ExternalAzureStorage(containerName: String,
         s"""${SnowflakeResultSetRDD.WORKER_LOG_PREFIX}:
            | Retrieve outputStream for uploading to external stage:
            | file: $file client request id: $requestID
+           | container=${blob.getContainer.getName}
+           | URI=${blob.getUri.getAuthority}
            |""".stripMargin.filter(_ >= ' '))
 
       if (compress) {
@@ -1241,7 +1340,8 @@ case class ExternalAzureStorage(containerName: String,
         _,
         compress,
         Map.empty[String, String],
-        maxRetryCount
+        maxRetryCount,
+        maxFileCountPerStage
       ),
       fileCountPerPartition
     )
@@ -1268,6 +1368,7 @@ case class InternalS3Storage(param: MergedParameters,
                                CloudStorageOperations.DEFAULT_PARALLELISM)
     extends CloudStorage {
   override val maxRetryCount = param.maxRetryCount
+  override val maxFileCountPerStage = param.maxFileCountPerStage
   override val proxyInfo: Option[ProxyInfo] = param.proxyInfo
 
   override protected def getStageInfo(
@@ -1320,7 +1421,8 @@ case class InternalS3Storage(param: MergedParameters,
         _,
         compress,
         stageInfo,
-        param.maxRetryCount
+        param.maxRetryCount,
+        param.maxFileCountPerStage
       ),
       param.expectedPartitionCount
     )
@@ -1468,6 +1570,7 @@ case class ExternalS3Storage(bucketName: String,
                              awsKey: String,
                              override val proxyInfo: Option[ProxyInfo],
                              override val maxRetryCount: Int,
+                             override val maxFileCountPerStage: Int,
                              fileCountPerPartition: Int,
                              awsToken: Option[String] = None,
                              pref: String = "",
@@ -1575,7 +1678,8 @@ case class ExternalS3Storage(bucketName: String,
         _,
         compress,
         Map.empty[String, String],
-        maxRetryCount
+        maxRetryCount,
+        maxFileCountPerStage
       ),
       fileCountPerPartition
     )
@@ -1608,6 +1712,7 @@ case class InternalGcsStorage(param: MergedParameters,
   override val proxyInfo: Option[ProxyInfo] = param.proxyInfo
   // Max retry count to upload a file
   override val maxRetryCount: Int = param.maxRetryCount
+  override val maxFileCountPerStage = param.maxFileCountPerStage
 
   // Generate file transfer metadata objects for file upload. On GCS,
   // the file transfer metadata is pre-signed URL and related metadata.
@@ -1714,7 +1819,7 @@ case class InternalGcsStorage(param: MergedParameters,
           metadatas.head
         }
         // Convert and upload the partition with the file transfer metadata
-        uploadPartition(rows, format, compress, directory, index, None, Some(metadata))
+        uploadPartition(rows, format, compress, Some(directory), index, None, Some(metadata))
 
         ///////////////////////////////////////////////////////////////////////
         // End code snippet to executed on worker

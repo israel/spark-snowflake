@@ -404,13 +404,14 @@ class SnowflakeResultSetRDDSuite extends IntegrationSuiteBase {
        |spark_connector_test_large_result_1234567890
        |""".stripMargin.filter(_ >= ' ')
 
+  val LARGE_TABLE_ROW_COUNT = 900000
   private def setupLargeResultTable(): Unit = {
     jdbcUpdate(s"""create or replace table $test_table_large_result (
                   | int_c int, c_string string(1024) )""".stripMargin)
 
     jdbcUpdate(s"""insert into $test_table_large_result select
                   | seq4(), '$largeStringValue'
-                  | from table(generator(rowcount => 900000))""".stripMargin)
+                  | from table(generator(rowcount => $LARGE_TABLE_ROW_COUNT))""".stripMargin)
 
     val tmpdf = sparkSession.read
       .format(SNOWFLAKE_SOURCE_NAME)
@@ -483,9 +484,10 @@ class SnowflakeResultSetRDDSuite extends IntegrationSuiteBase {
     })
 
     // Setup special options for this test
-    thisConnectorOptionsNoTable += ("partition_size_in_mb" -> "20")
+    thisConnectorOptionsNoTable += ("partition_size_in_mb" -> "2")
     thisConnectorOptionsNoTable += ("time_output_format" -> "HH24:MI:SS.FF")
     thisConnectorOptionsNoTable += ("s3maxfilesize" -> "1000001")
+    thisConnectorOptionsNoTable += ("max_file_count_per_stage" -> "3")
 
     setupNumberTable()
     setupStringBinaryTable()
@@ -719,13 +721,13 @@ class SnowflakeResultSetRDDSuite extends IntegrationSuiteBase {
 
       var resultSet: Array[Row] = tmpDF.collect()
       val sourceLength = resultSet.length
-      assert(sourceLength == 900000)
+      assert(sourceLength == LARGE_TABLE_ROW_COUNT)
 
       // Write the Data back to snowflake
       jdbcUpdate(s"drop table if exists $test_table_write")
       tmpDF.write
         .format(SNOWFLAKE_SOURCE_NAME)
-        .options(connectorOptionsNoTable)
+        .options(thisConnectorOptionsNoTable)
         .option("dbtable", test_table_write)
         .option("truncate_table", "off")
         .option("usestagingtable", "on")

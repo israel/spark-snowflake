@@ -2,9 +2,9 @@ name: Spark Connector Integration Test
 
 on:
   push:
-    branches: [ master ]
+    branches: [ nielsen ]
   pull_request:
-    branches: [ master ]
+    branches: [ nielsen ]
 
 jobs:
   test:

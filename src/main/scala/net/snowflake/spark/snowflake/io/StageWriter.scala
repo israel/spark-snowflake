@@ -27,6 +27,7 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.SaveMode
 import org.slf4j.LoggerFactory
 
+import scala.collection.immutable.HashMap
 import scala.util.Random
 
 // Snowflake doesn't support DDL in tran, so the State Machine is
@@ -106,8 +107,7 @@ class WriteTableState(conn: Connection) {
   def copyIntoTable(schema: StructType,
                     saveMode: SaveMode,
                     params: MergedParameters,
-                    file: String,
-                    tempStage: String,
+                    stageNamePrefixMap: Map[String, Option[String]],
                     format: SupportedFormat): Unit = {
     val targetTable = params.table.get
 
@@ -121,35 +121,38 @@ class WriteTableState(conn: Connection) {
       Option(targetTable)
     )
 
-    // Load the temporary data into the new file
-    val copyStatement =
-      StageWriter.copySql(
-        schema,
-        saveMode,
-        params,
-        targetTable,
-        file,
-        tempStage,
-        format,
-        conn
-      )
-    // copy
-    log.debug(Utils.sanitizeQueryText(copyStatement.toString))
-    // todo: handle on_error parameter on spark side
+    for ((tempStage, prefix) <- stageNamePrefixMap) {
+      // Load the temporary data into the new file
+      val copyStatement =
+        StageWriter.copySql(
+          schema,
+          saveMode,
+          params,
+          targetTable,
+          prefix,
+          tempStage,
+          format,
+          conn
+        )
+      // copy
+      log.debug(Utils.sanitizeQueryText(copyStatement.toString))
+      // todo: handle on_error parameter on spark side
 
-    // report the number of skipped files.
-    // todo: replace table name to Identifier(?) after bug fixed
-    val resultSet = copyStatement.execute(params.bindVariableEnabled)(conn)
-    if (params.continueOnError) {
-      var rowSkipped: Long = 0L
-      while (resultSet.next()) {
-        rowSkipped +=
-          resultSet.getLong("rows_parsed") -
-            resultSet.getLong("rows_loaded")
+      // report the number of skipped files.
+      // todo: replace table name to Identifier(?) after bug fixed
+      val resultSet = copyStatement.execute(params.bindVariableEnabled)(conn)
+      if (params.continueOnError) {
+        var rowSkipped: Long = 0L
+        while (resultSet.next()) {
+          rowSkipped +=
+            resultSet.getLong("rows_parsed") -
+              resultSet.getLong("rows_loaded")
+        }
+        log.error(s"ON_ERROR: Continue -> Skipped $rowSkipped rows")
       }
-      log.error(s"ON_ERROR: Continue -> Skipped $rowSkipped rows")
+      Utils.setLastCopyLoad(copyStatement.toString)
     }
-    Utils.setLastCopyLoad(copyStatement.toString)
+
     // post actions
     Utils.executePostActions(
       DefaultJDBCWrapper,
@@ -222,15 +225,26 @@ private[io] object StageWriter {
         params, conn, tempStage = true, None, "load")
 
       val filesToCopy = storage.upload(rdd, format, None)
-
       if (filesToCopy.nonEmpty) {
+        val stageNamePrefixMap = if (storage.isInstanceOf[InternalAzureStorage]) {
+          storage.asInstanceOf[InternalAzureStorage].getStagePrefixMap()
+        } else {
+          var result = new HashMap[String, Option[String]]
+          val prefixOption = if (filesToCopy.head.indexOf("/") > -1) {
+            Some(filesToCopy.head.substring(0, filesToCopy.head.indexOf("/")))
+          } else {
+            None
+          }
+          result += (stage -> prefixOption)
+          result
+        }
+
         writeToTable(
           conn,
           schema,
           saveMode,
           params,
-          filesToCopy.head.substring(0, filesToCopy.head.indexOf("/")),
-          stage,
+          stageNamePrefixMap,
           format
         )
       }
@@ -247,13 +261,12 @@ private[io] object StageWriter {
                            schema: StructType,
                            saveMode: SaveMode,
                            params: MergedParameters,
-                           file: String,
-                           tempStage: String,
+                           stageNamePrefixMap: Map[String, Option[String]],
                            format: SupportedFormat): Unit = {
     if (params.useStagingTable || !params.truncateTable) {
-      writeToTableWithStagingTable(conn, schema, saveMode, params, file, tempStage, format)
+      writeToTableWithStagingTable(conn, schema, saveMode, params, stageNamePrefixMap, format)
     } else {
-      writeToTableWithoutStagingTable(conn, schema, saveMode, params, file, tempStage, format)
+      writeToTableWithoutStagingTable(conn, schema, saveMode, params, stageNamePrefixMap, format)
     }
   }
 
@@ -261,12 +274,11 @@ private[io] object StageWriter {
     * load data from stage to table without staging table
     */
   private def writeToTableWithoutStagingTable(conn: Connection,
-                                           schema: StructType,
-                                           saveMode: SaveMode,
-                                           params: MergedParameters,
-                                           file: String,
-                                           tempStage: String,
-                                           format: SupportedFormat): Unit = {
+                                              schema: StructType,
+                                              saveMode: SaveMode,
+                                              params: MergedParameters,
+                                              stageNamePrefixMap: Map[String, Option[String]],
+                                              format: SupportedFormat): Unit = {
     val tableName: String = params.table.get.name
     val writeTableState = new WriteTableState(conn)
 
@@ -288,7 +300,7 @@ private[io] object StageWriter {
       }
 
       // Run COPY INTO and related commands
-      writeTableState.copyIntoTable(schema, saveMode, params, file, tempStage, format)
+      writeTableState.copyIntoTable(schema, saveMode, params, stageNamePrefixMap, format)
 
       // Commit a user transaction
       writeTableState.commit()
@@ -307,12 +319,11 @@ private[io] object StageWriter {
     * This function is deprecated.
     */
   private def writeToTableWithStagingTable(conn: Connection,
-                           schema: StructType,
-                           saveMode: SaveMode,
-                           params: MergedParameters,
-                           file: String,
-                           tempStage: String,
-                           format: SupportedFormat): Unit = {
+                                           schema: StructType,
+                                           saveMode: SaveMode,
+                                           params: MergedParameters,
+                                           stageNamePrefixMap: Map[String, Option[String]],
+                                           format: SupportedFormat): Unit = {
     val table = params.table.get
     val tempTable =
       TableName(
@@ -355,35 +366,39 @@ private[io] object StageWriter {
         Option(targetTable)
       )
 
-      // Load the temporary data into the new file
-      val copyStatement =
-        copySql(
-          schema,
-          saveMode,
-          params,
-          targetTable,
-          file,
-          tempStage,
-          format,
-          conn
-        )
-      // copy
-      log.debug(Utils.sanitizeQueryText(copyStatement.toString))
-      // todo: handle on_error parameter on spark side
+      // Loop to copy all files for all stages.
+      for ((tempStage, prefix) <- stageNamePrefixMap) {
+        // Load the temporary data into the new file
+        val copyStatement =
+          copySql(
+            schema,
+            saveMode,
+            params,
+            targetTable,
+            prefix,
+            tempStage,
+            format,
+            conn
+          )
+        // copy
+        log.debug(Utils.sanitizeQueryText(copyStatement.toString))
+        // todo: handle on_error parameter on spark side
 
-      // report the number of skipped files.
-      // todo: replace table name to Identifier(?) after bug fixed
-      val resultSet = copyStatement.execute(params.bindVariableEnabled)(conn)
-      if (params.continueOnError) {
-        var rowSkipped: Long = 0L
-        while (resultSet.next()) {
-          rowSkipped +=
-            resultSet.getLong("rows_parsed") -
-              resultSet.getLong("rows_loaded")
+        // report the number of skipped files.
+        // todo: replace table name to Identifier(?) after bug fixed
+        val resultSet = copyStatement.execute(params.bindVariableEnabled)(conn)
+        if (params.continueOnError) {
+          var rowSkipped: Long = 0L
+          while (resultSet.next()) {
+            rowSkipped +=
+              resultSet.getLong("rows_parsed") -
+                resultSet.getLong("rows_loaded")
+          }
+          log.error(s"ON_ERROR: Continue -> Skipped $rowSkipped rows")
         }
-        log.error(s"ON_ERROR: Continue -> Skipped $rowSkipped rows")
+        Utils.setLastCopyLoad(copyStatement.toString)
       }
-      Utils.setLastCopyLoad(copyStatement.toString)
+
       // post actions
       Utils.executePostActions(
         DefaultJDBCWrapper,
@@ -418,13 +433,13 @@ private[io] object StageWriter {
     * Generate the COPY SQL command
     */
   private[io] def copySql(schema: StructType,
-                      saveMode: SaveMode,
-                      params: MergedParameters,
-                      table: TableName,
-                      file: String,
-                      tempStage: String,
-                      format: SupportedFormat,
-                      conn: Connection): SnowflakeSQLStatement = {
+                          saveMode: SaveMode,
+                          params: MergedParameters,
+                          table: TableName,
+                          prefix: Option[String],
+                          tempStage: String,
+                          format: SupportedFormat,
+                          conn: Connection): SnowflakeSQLStatement = {
 
     if (saveMode != SaveMode.Append && params.columnMap.isDefined) {
       throw new UnsupportedOperationException(
@@ -502,7 +517,11 @@ private[io] object StageWriter {
           }
       }
 
-    val fromString = ConstantString(s"FROM @$tempStage/$file") !
+    val fromString = if (prefix.isDefined) {
+      ConstantString(s"FROM @$tempStage/${prefix.get}") !
+    } else {
+      ConstantString(s"FROM @$tempStage") !
+    }
 
     val mappingList: Option[List[(Int, String)]] = params.columnMap match {
       case Some(map) =>
